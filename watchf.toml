@@ -1,0 +1,3 @@
+build-cmd = ["cargo", "build"]
+run-cmd = ["cargo", "run"]
+watch = ["src"]
