@@ -5,7 +5,12 @@ use eyre::Context;
 use notify::{EventKind, RecursiveMode, Watcher};
 use serde::Deserialize;
 use std::{
-    any::Any, arch::x86_64::_MM_FROUND_RAISE_EXC, collections::HashMap, fs, io::Read, path::{Path, PathBuf}, process::{Command, Stdio}, sync::mpsc, time::SystemTime
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::mpsc,
+    time::SystemTime,
 };
 
 #[derive(Parser, Debug)]
@@ -54,30 +59,36 @@ fn main() -> eyre::Result<()> {
 
     let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
     let (run_tx, run_rx) = mpsc::channel::<()>();
-    
+
     let mut watcher = notify::recommended_watcher(tx)?;
 
     for f in config.watch.iter().map(PathBuf::as_path) {
         watcher.watch(f, RecursiveMode::Recursive)?;
     }
-    
+
     // Use a condvar instead?
     if args.command == Subcommand::Run {
         std::thread::spawn({
             let run_cmd = config.run_cmd.clone();
             move || {
-                let mut prog = Command::new(&run_cmd[0])
-                    .args(&run_cmd[1..])
-                    .spawn()
-                    .unwrap();
+                let mut prog: Option<Child> = None;
 
                 for _ in run_rx {
-                    prog.kill().context(format!("failed to kill child with pid {}", prog.id())).unwrap();
-                    prog.wait().unwrap();
-                    prog = Command::new(&run_cmd[0])
-                        .args(&run_cmd[1..])
-                        .spawn()
-                        .unwrap();
+                    if let Some(mut p) = prog {
+                        eprintln!("Killing child with pid {}...", p.id());
+                        p.kill()
+                            .context(format!("Failed to kill child with pid {}", p.id()))
+                            .unwrap();
+                        p.wait().unwrap();
+                    }
+
+                    eprintln!("Running run command: {:?}", run_cmd);
+                    prog = Some(
+                        Command::new(&run_cmd[0])
+                            .args(&run_cmd[1..])
+                            .spawn()
+                            .unwrap(),
+                    );
                 }
             }
         });
@@ -87,13 +98,20 @@ fn main() -> eyre::Result<()> {
         if rebuild {
             rebuild = false;
             last_rebuild = SystemTime::now();
-            for path in build(&config)? {
-                let meta = fs::metadata(&path)?;
-                let modified = meta.modified()?;
-                bins.insert(path.clone(), modified);
-            }
-            if args.command == Subcommand::Run {
-                run_tx.send(()).unwrap();
+            match build(&config) {
+                Err(e) => {
+                    eprintln!("Build failed: {e}");
+                }
+                Ok(paths) => {
+                    for path in paths {
+                        let meta = fs::metadata(&path)?;
+                        let modified = meta.modified()?;
+                        bins.insert(path.clone(), modified);
+                    }
+                    if args.command == Subcommand::Run {
+                        run_tx.send(()).unwrap();
+                    }
+                }
             }
         }
 
@@ -149,18 +167,15 @@ fn build(config: &Config) -> eyre::Result<Vec<PathBuf>> {
         pub doctest:     bool,
         pub test:        bool,
     }
-
-    let mut cmd = Command::new(&config.build_cmd[0])
+    eprintln!("Running build command: {:?}", config.build_cmd);
+    let cmd = Command::new(&config.build_cmd[0])
         .args(&config.build_cmd[1..])
         .args(["--message-format", "json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()?;
-    cmd.wait()?.exit_ok()?;
-
-    let mut stdout = String::new();
-    let mut stdout_r = cmd.stdout.unwrap();
-    stdout_r.read_to_string(&mut stdout)?;
+    let output = cmd.wait_with_output()?.exit_ok()?;
+    let stdout = String::from_utf8(output.stdout)?;
 
     let artifacts = stdout
         .lines()
@@ -176,5 +191,6 @@ fn build(config: &Config) -> eyre::Result<Vec<PathBuf>> {
         })
         .filter_map(|artifact| artifact.executable)
         .collect::<Vec<_>>();
+    eprintln!("Done running build command: {:?}", config.build_cmd);
     Ok(artifacts)
 }
